@@ -1,0 +1,154 @@
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jenkins
+
+---
+# ServiceAccount for Jenkins
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins
+  namespace: jenkins
+
+---
+# Role with permissions for Jenkins to manage pods
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jenkins
+  namespace: jenkins
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/exec", "pods/log", "persistentvolumeclaims", "events"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["secrets", "configmaps"]
+  verbs: ["get", "list", "watch"]
+
+---
+# RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jenkins
+  namespace: jenkins
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: jenkins
+subjects:
+- kind: ServiceAccount
+  name: jenkins
+  namespace: jenkins
+
+---
+# PersistentVolumeClaim for Jenkins data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jenkins-pvc
+  namespace: jenkins
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jenkins
+  namespace: jenkins
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jenkins
+  template:
+    metadata:
+      labels:
+        app: jenkins
+    spec:
+      serviceAccountName: jenkins
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+      
+      containers:
+      - name: jenkins
+        image: jenkins/jenkins:lts
+        imagePullPolicy: Always
+        
+        env:
+        - name: JAVA_OPTS
+          value: "-Djenkins.install.runSetupWizard=false"
+        - name: JENKINS_ADMIN_ID
+          value: "admin"
+        - name: JENKINS_ADMIN_PASSWORD
+          value: "admin123"
+        
+        ports:
+        - name: http-port
+          containerPort: 8080
+        - name: jnlp-port
+          containerPort: 50000
+        
+        volumeMounts:
+        - name: jenkins-home
+          mountPath: /var/jenkins_home
+        
+        livenessProbe:
+          httpGet:
+            path: /login
+            port: 8080
+          initialDelaySeconds: 120
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 5
+        
+        readinessProbe:
+          httpGet:
+            path: /login
+            port: 8080
+          initialDelaySeconds: 90
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "1Gi"
+          limits:
+            cpu: "2000m"
+            memory: "2Gi"
+      
+      volumes:
+      - name: jenkins-home
+        persistentVolumeClaim:
+          claimName: jenkins-pvc
+
+---
+# Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins-service
+  namespace: jenkins
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  - name: jnlp
+    port: 50000
+    targetPort: 50000
+  selector:
+    app: jenkins
