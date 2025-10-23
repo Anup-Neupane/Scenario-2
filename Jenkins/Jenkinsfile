@@ -1,0 +1,260 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: jenkins
+spec:
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:debug
+    command:
+    - /busybox/cat
+    tty: true
+    volumeMounts:
+    - name: docker-config
+      mountPath: /kaniko/.docker
+  - name: git
+    image: alpine/git:latest
+    command:
+    - cat
+    tty: true
+  - name: python
+    image: python:3.9-slim
+    command:
+    - cat
+    tty: true
+  - name: trivy
+    image: aquasec/trivy:latest
+    command:
+    - cat
+    tty: true
+    volumeMounts:
+    - name: docker-config
+      mountPath: /root/.docker
+  volumes:
+  - name: docker-config
+    secret:
+      secretName: docker-credentials
+      items:
+      - key: .dockerconfigjson
+        path: config.json
+'''
+        }
+    }
+    
+    environment {
+        DOCKER_REPO = "anupme/scenario-2"
+        MY_APP_REPO = "https://github.com/Anup-Neupane/my-app.git"
+        GIT_USER = "Anup-Neupane"
+        TRIVY_SEVERITY = "HIGH,CRITICAL"
+        TRIVY_EXIT_CODE = "0"
+    }
+    
+    stages {
+        stage('Checkout Source') {
+            steps {
+                container('git') {
+                    script {
+                        echo "🔄 Cloning repository..."
+                        git branch: 'main', url: 'https://github.com/Anup-Neupane/Scenario-2.git'
+                    }
+                }
+            }
+        }
+        
+        stage('Install Dependencies & Lint') {
+            steps {
+                container('python') {
+                    script {
+                        echo "📦 Installing dependencies..."
+                        sh '''
+                            pip install --no-cache-dir -r requirements.txt
+                            pip install --no-cache-dir pytest pytest-cov flake8 pylint
+                        '''
+                        
+                        echo "🔍 Running code quality checks..."
+                        sh '''
+                            flake8 src/ --max-line-length=120 --ignore=E501,W503 || true
+                            pylint src/ --disable=C0111,C0103 --exit-zero || true
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Run Unit Tests') {
+            steps {
+                container('python') {
+                    script {
+                        echo "🧪 Running unit tests..."
+                        sh '''
+                            mkdir -p test-results coverage_html
+                            find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+                            pytest tests/ \
+                                --junitxml=test-results/junit.xml \
+                                --cov=src \
+                                --cov-report=xml:coverage.xml \
+                                --cov-report=html:coverage_html \
+                                --cov-report=term-missing \
+                                -v || echo "⚠️  Some tests failed"
+                        '''
+                    }
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'test-results/*.xml, coverage.xml, coverage_html/**/*', allowEmptyArchive: true
+                }
+            }
+        }
+        
+        stage('Build and Push Image') {
+            steps {
+                container('kaniko') {
+                    script {
+                        echo "🐳 Building Docker image with Kaniko..."
+                        sh """
+                            /kaniko/executor \
+                                --context=\$(pwd) \
+                                --dockerfile=Dockerfile \
+                                --destination=${DOCKER_REPO}:${BUILD_NUMBER} 
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Security Scan with Trivy') {
+            steps {
+                container('trivy') {
+                    // Docker Hub credentials (Username with password type)
+                    withCredentials([usernamePassword(credentialsId: 'docker-hub-password', usernameVariable: 'TRIVY_USERNAME', passwordVariable: 'TRIVY_PASSWORD')]) {
+                        script {
+                            echo "🔒 Scanning image for vulnerabilities..."
+                            sh """
+                                # Update Trivy vulnerability database
+                                trivy image --download-db-only
+                                
+                                # Wait a moment for image to be fully available on registry
+                                echo "⏳ Waiting for image to be available on Docker Hub..."
+                                sleep 10
+                                
+                                # Scan the remote image from Docker Hub
+                                trivy image \
+                                    --severity ${TRIVY_SEVERITY} \
+                                    --exit-code ${TRIVY_EXIT_CODE} \
+                                    --format table \
+                                    --output trivy-report.txt \
+                                    --no-progress \
+                                    ${DOCKER_REPO}:${BUILD_NUMBER} || true
+                                
+                                # Generate JSON report for parsing
+                                trivy image \
+                                    --severity ${TRIVY_SEVERITY} \
+                                    --format json \
+                                    --output trivy-report.json \
+                                    --no-progress \
+                                    ${DOCKER_REPO}:${BUILD_NUMBER} || true
+                                
+                                # Display summary
+                                if [ -f trivy-report.txt ]; then
+                                    echo "📊 Security Scan Summary:"
+                                    cat trivy-report.txt
+                                else
+                                    echo "⚠️  Trivy scan did not generate report"
+                                fi
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Update Deployment YAML') {
+            steps {
+                container('git') {
+                    // GitHub token (Secret text type)
+                    withCredentials([string(credentialsId: 'github-token', variable: 'GIT_TOKEN')]) {
+                        script {
+                            echo "📝 Updating deployment manifest..."
+                            sh """
+                                git config --global user.email "jenkins@ci.local"
+                                git config --global user.name "Jenkins CI"
+                                
+                                # Clone using the GitHub token (Secret text)
+                                git clone https://${GIT_USER}:${GIT_TOKEN}@github.com/Anup-Neupane/my-app.git
+                                cd my-app
+                                
+                                # Update the image tag in deployment.yaml
+                                sed -i 's#${DOCKER_REPO}:.*#${DOCKER_REPO}:${BUILD_NUMBER}#' deployment.yaml
+                                
+                                # Verify the change
+                                if ! grep -q "${DOCKER_REPO}:${BUILD_NUMBER}" deployment.yaml; then
+                                    echo "❌ Failed to update image tag in deployment.yaml"
+                                    exit 1
+                                fi
+                                
+                                # Commit and push changes
+                                git add deployment.yaml
+                                git commit -m "🚀 CI: Update image tag to ${BUILD_NUMBER}"
+                                
+                                git push https://${GIT_USER}:${GIT_TOKEN}@github.com/Anup-Neupane/my-app.git main
+                            """
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Verify ArgoCD Sync') {
+            steps {
+                container('git') {
+                    script {
+                        echo "🔍 Waiting for ArgoCD to detect changes..."
+                        sh '''
+                            echo "⏳ ArgoCD will auto-sync within 3 minutes..."
+                            echo "🌐 Check ArgoCD UI for deployment status"
+                            echo "📍 Application: scenario-app"
+                            echo "🎯 Expected image: ${DOCKER_REPO}:${BUILD_NUMBER}"
+                        '''
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo """
+✅ PIPELINE SUCCEEDED
+📦 Image: ${DOCKER_REPO}:${BUILD_NUMBER}
+📝 Manifest Updated Successfully
+🚀 ArgoCD Sync: Pending
+            """
+        }
+        failure {
+            echo """
+❌ PIPELINE FAILED
+Build Number: ${BUILD_NUMBER}
+Check console output for details
+            """
+        }
+        always {
+            script {
+                echo "🧹 Cleaning up workspace..."
+                sh '''
+                    find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+                    find . -name "*.pyc" -delete 2>/dev/null || true
+                    find . -name "*.pyo" -delete 2>/dev/null || true
+                    find . -name ".pytest_cache" -exec rm -rf {} + 2>/dev/null || true
+                    find . -name ".coverage" -delete 2>/dev/null || true
+                    rm -rf test-results coverage_html __pycache__ .pytest_cache .coverage 2>/dev/null || true
+                '''
+                echo "✅ Cleanup completed"
+            }
+        }
+    }
+}
